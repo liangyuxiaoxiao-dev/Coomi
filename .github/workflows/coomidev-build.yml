@@ -11,6 +11,10 @@ on:
         description: Upload the CoomiDev APK as an artifact
         type: boolean
         default: true
+      runtime_repository:
+        description: Repository hosting the pinned runtime (default TensorHub-ORG/Coomi)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -25,7 +29,7 @@ jobs:
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: '2'
-      RUNTIME_REPOSITORY: ${{ vars.COOMI_RUNTIME_REPOSITORY || github.repository }}
+      RUNTIME_REPOSITORY: ${{ inputs.runtime_repository || 'TensorHub-ORG/Coomi' }}
     steps:
       - name: Resolve source ref
         id: ref
