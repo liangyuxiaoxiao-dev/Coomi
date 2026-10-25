@@ -1,0 +1,123 @@
+name: CoomiDev APK Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag to build (default current branch)
+        type: string
+        default: ''
+      upload_apk:
+        description: Upload the CoomiDev APK as an artifact
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coomidev-build-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RUNTIME_REPOSITORY: ${{ vars.COOMI_RUNTIME_REPOSITORY || github.repository }}
+    steps:
+      - name: Resolve source ref
+        id: ref
+        run: |
+          REF="${{ inputs.ref }}"
+          if [ -z "$REF" ]; then REF="${{ github.ref_name }}"; fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.0'
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install Android SDK/NDK
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.0.12077973'
+
+      - name: Install Rust toolchain
+        working-directory: apps/coomi-rs
+        run: rustup show active-toolchain
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/coomi-rs/Cargo.lock', 'apps/coomi-rs/rust-toolchain.toml') }}
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Web type-check and build
+        working-directory: apps/web
+        run: npm run build
+
+      - name: Web tests
+        working-directory: apps/web
+        run: npm test
+
+      - name: Rust tests (smallest relevant)
+        working-directory: apps/coomi-rs
+        run: cargo test --workspace --locked
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: runtime-v2-dist
+          key: runtime-v2-${{ env.RUNTIME_REPOSITORY }}-${{ hashFiles('apps/coomi-app/app/src/main/assets/runtime-v2-manifest.json') }}
+
+      - name: Download and verify pinned runtime
+        run: python3 scripts/runtime-v2/download.py --repository "$RUNTIME_REPOSITORY"
+
+      - name: Bundle generated runtime manifest
+        run: cp runtime-v2-dist/runtime-v2-manifest.json apps/coomi-app/app/src/main/assets/runtime-v2-manifest.json
+
+      - name: Build CoomiDev APK (debug-signed preview)
+        env:
+          COOMI_DEV_BUILD: '1'
+        run: ./gradlew --no-daemon --max-workers=2 :app:printVersionInfo :app:assembleRelease
+
+      - name: Verify APK package identity and signature
+        run: |
+          set -euo pipefail
+          APK=$(ls app/build/outputs/apk/release/*-arm64-v8a-release.apk | head -1)
+          echo "APK=$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump badging "$APK" | head -5
+          PACKAGE=$("$ANDROID_HOME/build-tools/36.0.0/aapt2" dump badging "$APK" | grep -oP "package: name='\K[^']+")
+          LABEL=$("$ANDROID_HOME/build-tools/36.0.0/aapt2" dump badging "$APK" | grep -oP "application-label:\s*'\K[^']+")
+          echo "Package: $PACKAGE"
+          echo "Label: $LABEL"
+          test "$PACKAGE" = "com.coomidev.android" || { echo "Unexpected package: $PACKAGE"; exit 1; }
+          test "$LABEL" = "CoomiDev" || { echo "Unexpected label: $LABEL"; exit 1; }
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$APK" | head -10
+
+      - name: Upload CoomiDev APK
+        if: ${{ inputs.upload_apk != false }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: coomidev-apk
+          path: app/build/outputs/apk/release/*-arm64-v8a-release.apk
+          if-no-files-found: error
+          retention-days: 14
