@@ -27,6 +27,8 @@ export interface ModelParameters {
   reasoningEffort?: string
   reasoningField?: string
   reasoningMapping?: Partial<Record<'low' | 'medium' | 'high' | 'xhigh', string>>
+  /** 该模型支持的推理档位（低/中/高/超高 中取哪些）；空数组表示不支持思考。 */
+  reasoningLevels?: string[]
 }
 export interface CapabilityOverride { text?: boolean; vision?: boolean; image_generation?: boolean; reasoning?: boolean }
 export interface SubAgentConfig { id: string; providerId: string; model: string; description?: string }
@@ -151,6 +153,94 @@ export const REASONING_EFFORTS: { value: ReasoningEffort; label: string }[] = [
   { value: 'high', label: '高' },
   { value: 'xhigh', label: '超高' },
 ]
+
+/** 模型名到推理档位的启发式推断（与后端 capabilities.rs 保持一致，未配置时兜底）。 */
+const REASONING_LEVEL_BY_MODEL_NAME: Array<{ match: (m: string) => boolean; levels: string[] }> = [
+  { match: m => m.includes('gpt-5') || m.startsWith('o') || m.includes('claude') && m.includes('thinking'), levels: ['low', 'medium', 'high', 'xhigh'] },
+  { match: m => m.includes('reason') || m.includes('thinking'), levels: ['low', 'medium', 'high'] },
+]
+
+function inferReasoningLevels(model: string): string[] {
+  const lower = model.toLowerCase()
+  for (const rule of REASONING_LEVEL_BY_MODEL_NAME) {
+    if (rule.match(lower)) return rule.levels
+  }
+  return ['low', 'medium', 'high', 'xhigh']
+}
+
+/** 读取某 Provider 某模型的推理档位配置：优先模型参数 -> localStorage 覆盖 -> 模型名推断。 */
+export function getModelReasoningLevels(provider: ProviderConfig | null | undefined, model: string): string[] {
+  if (!provider || !model) return []
+  const fromParams = provider.modelParameters?.[model]?.reasoningLevels
+  if (Array.isArray(fromParams)) return fromParams
+  const localKey = `coomi.reasoningLevels.${provider.id}:${model}`
+  try {
+    const local = JSON.parse(localStorage.getItem(localKey) ?? '') as unknown
+    if (Array.isArray(local)) return local
+  } catch { /* 忽略损坏的 localStorage */ }
+  return inferReasoningLevels(model)
+}
+
+/** 当前选中模型的推理档位列表。 */
+export function getCurrentReasoningLevels(): string[] {
+  const cfg = useConfigStore()
+  return getModelReasoningLevels(cfg.currentProvider, cfg.currentModel)
+}
+
+/** 判断某模型是否支持思考。 */
+export function modelSupportsReasoning(provider: ProviderConfig | null | undefined, model: string): boolean {
+  return getModelReasoningLevels(provider, model).length > 0
+}
+
+/** 归一化档位：旧值不在新模型支持列表时，回落到该模型默认档（优先 auto，否则中间档）。 */
+export function normalizeReasoningEffort(effort: ReasoningEffort | null | undefined, levels: string[]): ReasoningEffort {
+  if (effort === 'auto') return 'auto'
+  if (effort && levels.includes(effort)) return effort as ReasoningEffort
+  if (levels.includes('medium')) return 'medium'
+  if (levels.length === 0) return 'auto'
+  return levels[Math.floor((levels.length - 1) / 2)] as ReasoningEffort
+}
+
+/** 将档位列表存储到模型参数（本地响应式 + localStorage + 后端 modelParameters 持久化）。 */
+export async function setModelReasoningLevels(providerId: string, model: string, levels: string[]): Promise<void> {
+  const cfg = useConfigStore()
+  const provider = cfg.providers.find(p => p.id === providerId)
+  // 本地响应式更新
+  if (provider) {
+    const params = { ...(provider.modelParameters?.[model] ?? {}) }
+    params.reasoningLevels = levels
+    provider.modelParameters = { ...(provider.modelParameters ?? {}), [model]: params }
+  }
+  // localStorage 覆盖（跨设备快速生效，且后端未配置时兜底）
+  localStorage.setItem(`coomi.reasoningLevels.${providerId}:${model}`, JSON.stringify(levels))
+  // 持久化到后端 modelParameters（modelParameters 为透传 JSON，无需改 Rust）
+  if (provider) {
+    await cfg.upsertProvider({
+      id: provider.id,
+      name: provider.name,
+      apiKey: '',
+      models: provider.models,
+      baseUrl: provider.baseUrl,
+      type: provider.type,
+      toolProtocol: provider.toolProtocol,
+      contextWindow: provider.contextWindow,
+      modelContextWindows: provider.modelContextWindows,
+      fastModel: provider.fastModel,
+      supportsWebSearch: provider.supportsWebSearch,
+      supportsVision: provider.supportsVision,
+      modelDescriptions: provider.modelDescriptions,
+      modelParameters: provider.modelParameters,
+      capabilityOverrides: provider.capabilityOverrides,
+    })
+  }
+}
+
+/** 取当前模型可显示在滑块上的档位（含 auto，供 UI 使用）。 */
+export function getCurrentReasoningEffortOptions(): { value: ReasoningEffort; label: string }[] {
+  const levels = getCurrentReasoningLevels()
+  const options = REASONING_EFFORTS.filter(item => item.value === 'auto' || levels.includes(item.value))
+  return options
+}
 
 /** 取当前主题档位：优先 Android 原生偏好（JS 桥），其次 localStorage，默认跟随系统。 */
 export function readThemeMode(): ThemeMode {
@@ -286,6 +376,7 @@ export const useConfigStore = defineStore('config', () => {
       currentProviderId.value = ''
       currentModel.value = ''
     }
+    normalizeCurrentReasoningEffort()
   }
 
   /** 从后端拉取 Provider 列表；失败则用 mock 兜底（浏览器独立开发）。 */
@@ -309,19 +400,33 @@ export const useConfigStore = defineStore('config', () => {
     currentProviderId.value = providerId; currentModel.value = model
     localStorage.setItem('coomi.providerId', providerId)
     localStorage.setItem('coomi.model', model)
+    normalizeCurrentReasoningEffort()
   }
   /** 只同步顶栏的模型显示，不写 localStorage（切换会话时用，避免污染全局默认选择）。 */
   function syncDisplayModel(providerId: string, model: string) {
     currentProviderId.value = providerId
     currentModel.value = model
+    normalizeCurrentReasoningEffort(false)
   }
   function setPermissionMode(mode: PermissionMode) {
     permissionMode.value = mode
     localStorage.setItem('coomi.permissionMode', mode)
   }
   function setReasoningEffort(effort: ReasoningEffort) {
-    reasoningEffort.value = effort
-    localStorage.setItem('coomi.reasoningEffort', effort)
+    // 只改 UI 状态：档位不在当前模型支持列表时回落默认档，避免错档
+    const levels = getModelReasoningLevels(currentProvider.value, currentModel.value)
+    reasoningEffort.value = normalizeReasoningEffort(effort, levels)
+    localStorage.setItem('coomi.reasoningEffort', reasoningEffort.value)
+  }
+
+  /** 模型变化后归一化档位：旧档不存在时回落到新模型默认档。 */
+  function normalizeCurrentReasoningEffort(persist = true) {
+    const levels = getModelReasoningLevels(currentProvider.value, currentModel.value)
+    const next = normalizeReasoningEffort(reasoningEffort.value, levels)
+    if (next !== reasoningEffort.value) {
+      reasoningEffort.value = next
+      if (persist) localStorage.setItem('coomi.reasoningEffort', next)
+    }
   }
   function setMaxToolRounds(rounds: number) {
     maxToolRounds.value = [192, 256, 512].includes(rounds) ? rounds : 192
@@ -753,6 +858,7 @@ export const useConfigStore = defineStore('config', () => {
     permissionMode, defaultPermissionMode, planMode, themeMode, reasoningEffort, maxToolRounds, connectionSettings, globalMemory, digitalLifeEnabled, lifeGlobalMode, setLifeGlobalMode, customPrompt, productionMode, setProductionMode, berserkModel, setBerserkModel, sendMorphAnimation, setSendMorphAnimation, allAnimationsOff, setAllAnimationsOff, minimalUi, setMinimalUi, providers, activeId, loading, usingMock, lastError, subAgentSettings,
     currentProviderId, currentModel, currentProvider, mergedProviders,
     fetchProviders, selectModel, syncDisplayModel, validateAndSelectModel, setPermissionMode, syncStartupPermission, setThemeMode, setReasoningEffort, setMaxToolRounds, fetchConnectionSettings, saveConnectionSettings, cyclePermissionMode, setDefaultPermissionMode, togglePlanMode,
+    getModelReasoningLevels, getCurrentReasoningLevels, modelSupportsReasoning, getCurrentReasoningEffortOptions, setModelReasoningLevels, normalizeCurrentReasoningEffort,
     toggleGlobalMemory, syncGlobalMemoryFromEngine, setDigitalLifeEnabled, syncDigitalLifeEnabled, fetchCustomPrompt, saveCustomPrompt,
     upsertProvider, deleteProvider, activateProvider, copyProvider, revealProviderKey, discoverModels, fetchSubAgentSettings, saveSubAgentSettings,
   }

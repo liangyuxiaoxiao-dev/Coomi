@@ -191,6 +191,31 @@ function modelParams(model: string): ModelParameters {
   return draft.value.modelParameters[model]
 }
 
+/** 推理档位预设选项（供模型参数区选择）。 */
+const reasoningLevelOptions: ThemeSelectOption[] = [
+  { value: '', label: '默认（按模型名推断）' },
+  { value: 'none', label: '不支持思考' },
+  { value: 'low,medium,high', label: '3 档（低/中/高）' },
+  { value: 'low,medium,high,xhigh', label: '4 档（低/中/高/超高）' },
+  { value: 'auto,low,medium,high,xhigh', label: '5 档（自动/低/中/高/超高）' },
+]
+
+function modelReasoningLevelsValue(model: string): string {
+  const levels = modelParams(model).reasoningLevels
+  if (!Array.isArray(levels)) return ''
+  if (!levels.length) return 'none'
+  return levels.join(',')
+}
+
+function setModelReasoningLevelsPreset(model: string, value: string) {
+  const params = modelParams(model)
+  if (!value) {
+    delete params.reasoningLevels
+    return
+  }
+  params.reasoningLevels = value === 'none' ? [] : value.split(',')
+}
+
 function updateOptionalNumber(model: string, key: 'temperature' | 'topK', event: Event) {
   const input = event.target as HTMLInputElement
   const params = modelParams(model)
@@ -696,6 +721,16 @@ function openModelConfig() {
                 <input type="number" min="1" max="65536" step="1" placeholder="默认" :value="modelParams(model).topK ?? ''" @input="updateOptionalNumber(model, 'topK', $event)" />
               </label>
               <div class="model-param"><span>推理映射<small>Coomi 四档</small></span><button type="button" class="mapping-trigger" @click="toggleModelHelp(model)">{{ reasoningSummary(model) }}</button></div>
+              <label class="model-param"><span>推理档位</span>
+                <ThemeSelect
+                  class="reasoning-levels-select"
+                  :model-value="modelReasoningLevelsValue(model)"
+                  :options="reasoningLevelOptions"
+                  :title="`${model} 推理档位`"
+                  :aria-label="`${model} 推理档位`"
+                  @update:model-value="setModelReasoningLevelsPreset(model, $event)"
+                />
+              </label>
               <label class="model-param model-context"><span>上下文窗口</span>
                 <span class="context-fields">
                   <ThemeSelect
@@ -824,6 +859,8 @@ function openModelConfig() {
 .model-param small { display:block; overflow:hidden; color:var(--text-3); font-size:7.5px; font-weight:400; text-overflow:ellipsis; }
 .model-param input { width: 100%; min-width: 0; min-height: 30px; padding: 0 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--fill); color: var(--text-2); font-size: 10.5px; }
 .mapping-trigger { width:100%; min-width:0; min-height:30px; padding:0 5px; overflow:hidden; border:1px solid var(--border); border-radius:5px; background:var(--fill); color:var(--text-2); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
+.reasoning-levels-select { width: 100%; min-width: 0; }
+.reasoning-levels-select :deep(.theme-select) { width: 100%; min-height: 30px; }
 .context-fields { display: flex; min-width: 0; gap: 4px; }
 .capability-overrides { display: grid; grid-template-columns: auto repeat(3, minmax(0, 1fr)); align-items: center; gap: 8px; margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--border); color: var(--text-2); font-size: 11px; }
 .capability-overrides > span { color: var(--text-3); font-size: 9.5px; }

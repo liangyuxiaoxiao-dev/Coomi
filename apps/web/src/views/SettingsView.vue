@@ -6,7 +6,7 @@
 import { computed, ref, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { goBack } from '@/bridge/navigation'
-import { useConfigStore, DEFAULT_CONNECTION_SETTINGS, PERMISSION_MODES, REASONING_EFFORTS, type ConnectionSettings } from '@/stores/config'
+import { useConfigStore, DEFAULT_CONNECTION_SETTINGS, PERMISSION_MODES, getCurrentReasoningLevels, type ConnectionSettings } from '@/stores/config'
 import { useSessionStore } from '@/stores/session'
 import { useSessionsStore } from '@/stores/sessions'
 import { useConnectionStore } from '@/stores/connection'
@@ -15,6 +15,7 @@ import { hasNativeTts } from '@/bridge/tts'
 import { settingsTab, settingsScroll } from '@/stores/viewState'
 import type { PermissionMode } from '@/protocol/commands'
 import AutoCompactionSettings from '@/components/AutoCompactionSettings.vue'
+import ReasoningSlider from '@/components/ReasoningSlider.vue'
 import PageHead from '@/components/PageHead.vue'
 import CoomiIcon from '@/components/CoomiIcon.vue'
 
@@ -23,6 +24,35 @@ const config = useConfigStore()
 const session = useSessionStore()
 const sessions = useSessionsStore()
 const connection = useConnectionStore()
+
+/** 模型推理档位预设：与滑块联动。key 同时用于识别当前配置。 */
+const reasoningLevelPresets: { value: string; label: string; levels: string[] }[] = [
+  { value: 'none', label: '不支持', levels: [] },
+  { value: '3', label: '3 档', levels: ['low', 'medium', 'high'] },
+  { value: '4', label: '4 档', levels: ['low', 'medium', 'high', 'xhigh'] },
+  { value: '5', label: '5 档', levels: ['auto', 'low', 'medium', 'high', 'xhigh'] },
+]
+
+function levelsKey(levels: string[]): string {
+  if (!levels.length) return 'none'
+  const joined = levels.join(',')
+  if (joined === 'low,medium,high') return '3'
+  if (joined === 'low,medium,high,xhigh') return '4'
+  if (joined === 'auto,low,medium,high,xhigh') return '5'
+  return 'custom'
+}
+
+const currentLevelsKey = computed(() => levelsKey(getCurrentReasoningLevels()))
+
+async function applyReasoningLevelPreset(value: string) {
+  const preset = reasoningLevelPresets.find(p => p.value === value)
+  if (!preset) return
+  const providerId = config.currentProviderId
+  const model = config.currentModel
+  if (!providerId || !model) return
+  await config.setModelReasoningLevels(providerId, model, preset.levels)
+  config.normalizeCurrentReasoningEffort()
+}
 
 const connectionDraft = ref<ConnectionSettings>({ ...config.connectionSettings })
 const reconnectInitialSeconds = ref(config.connectionSettings.reconnectInitialDelayMs / 1000)
@@ -228,11 +258,33 @@ onMounted(async () => {
 
 <template v-if="activeTab === 'chat'">
       <p class="sec-label">推理强度</p>
-      <div class="group compact-options">
-        <button v-for="item in REASONING_EFFORTS" :key="item.value" class="option" :class="{ selected: config.reasoningEffort === item.value }" @click="session.setReasoningEffort(item.value)">
-          {{ item.label }}
+      <div class="group reasoning-group">
+        <div class="reasoning-model">
+          <span class="rmain">当前模型</span>
+          <span class="rsub">{{ config.currentModel || '未选择模型' }}</span>
+        </div>
+        <ReasoningSlider
+          :levels="getCurrentReasoningLevels()"
+          :model-value="config.reasoningEffort"
+          :disabled="!getCurrentReasoningLevels().length"
+          @update:model-value="v => (config.reasoningEffort = v)"
+          @commit="session.setReasoningEffort"
+        />
+        <p class="option-note">拖动调整推理强度，松手后生效。档位随模型自动变化。</p>
+      </div>
+      <p class="sec-label">模型推理档位</p>
+      <div class="group compact-options reasoning-levels">
+        <button
+          v-for="preset in reasoningLevelPresets"
+          :key="preset.value"
+          class="option"
+          :class="{ selected: currentLevelsKey === preset.value }"
+          @click="applyReasoningLevelPreset(preset.value)"
+        >
+          {{ preset.label }}
         </button>
       </div>
+      <p class="option-note">配置当前模型支持的推理档位数量；不支持思考时滑块自动置灰。</p>
 
 </template>
 
@@ -499,6 +551,11 @@ onMounted(async () => {
 }
 .compact-options { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); padding: 5px; gap: 4px; }
 .compact-options.rounds { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.compact-options.reasoning-levels { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.reasoning-group { padding: 10px 12px 8px; }
+.reasoning-model { display: flex; flex-direction: column; gap: 1px; margin-bottom: 6px; }
+.reasoning-model .rmain { font-size: 13px; font-weight: 650; color: var(--text-1); }
+.reasoning-model .rsub { font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .option { min-width: 0; height: 38px; padding: 0 4px; border-radius: 6px; background: transparent; color: var(--text-2); font-size: 13px; }
 .option.selected { background: var(--blue-soft); color: var(--blue); font-weight: 650; }
 .option-note { margin: 6px 4px 0; font-size: 11.5px; color: var(--text-3); }
